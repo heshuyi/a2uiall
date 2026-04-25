@@ -1,0 +1,34 @@
+{
+  "name": "@a2ui/server",
+  "version": "0.0.1",
+  "private": true,
+  "description": "A2UI 0.8 后端 Agent：Express + Gemini + SSE",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "echo 'source-only (uses tsx at runtime)'",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'no lint'",
+    "test": "echo 'no tests'",
+    "clean": "rm -rf dist .turbo"
+  },
+  "dependencies": {
+    "@a2ui/protocol": "workspace:*",
+    "@google/genai": "^0.7.0",
+    "better-sqlite3": "^11.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "undici": "^7.16.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
