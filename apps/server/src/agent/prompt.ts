@@ -460,6 +460,26 @@ const CATALOG_SCHEMA = {
   },
 };
 
+/**
+ * 构建 responseJsonSchema —— 用于 Gemini JSON mode 的 constrained decoding。
+ * 只保留顶层结构约束，具体字段校验由 system prompt 内的详细 schema 说明覆盖。
+ */
+export function buildResponseJsonSchema() {
+  return {
+    type: 'object',
+    properties: {
+      messages: {
+        type: 'array',
+        items: {
+          type: 'object',
+          description: 'A2UI server-to-client message. Each object MUST contain exactly one of: beginRendering, surfaceUpdate, dataModelUpdate.',
+        },
+      },
+    },
+    required: ['messages'],
+  };
+}
+
 export function buildSystemPrompt(surfaceId: string): string {
   const s2cStr = JSON.stringify(SERVER_TO_CLIENT_SCHEMA, null, 2);
   const catalogStr = JSON.stringify(CATALOG_SCHEMA, null, 2);
@@ -468,13 +488,12 @@ export function buildSystemPrompt(surfaceId: string): string {
 
 # 你的工作
 - 接收用户的自然语言请求或上一轮 userAction
-- 输出 NDJSON（newline-delimited JSON）：每一行都是一个 A2UI server-to-client 消息的 JSON 对象
-- 你的输出将被服务端边读边解析并实时推送给前端，因此每行必须是完整的 JSON（不能跨行）
+- 输出一个 JSON 对象 { "messages": [...] }，其中 messages 数组包含所有 A2UI server-to-client 消息
 
-# 输出顺序
-1) 第 1 行必须是 beginRendering，root 固定为 "root"
-2) 第 2 行起输出 1+ 行 surfaceUpdate（必须包含 id="root" 的根组件实例）
-3) 随后输出 0+ 行 dataModelUpdate
+# messages 数组顺序
+1) 第 1 个元素必须是 beginRendering，root 固定为 "root"
+2) 第 2 个元素起放 1+ 个 surfaceUpdate（必须包含 id="root" 的根组件实例）
+3) 随后放 0+ 个 dataModelUpdate
 
 # 必填参数
 - 所有消息的 surfaceId 必须等于：${surfaceId}
@@ -499,12 +518,9 @@ ${catalogStr}
 - dataModelUpdate.contents 必须严格是 DataEntry[]（key + valueString/valueNumber/valueBoolean/valueMap）
 - 不要把 JSON 嵌套进 valueString
 - 中文 UI 文案
-- 不要输出 markdown、代码块或解释文字，只输出 JSON 行
 
 # 示例
-{"beginRendering":{"surfaceId":"${surfaceId}","root":"root"}}
-{"surfaceUpdate":{"surfaceId":"${surfaceId}","catalogId":"${STANDARD_CATALOG_ID}","components":[{"id":"root","component":{"Card":{"child":"col"}}},{"id":"col","component":{"Column":{"alignment":"stretch","children":{"explicitList":["title","list"]}}}},{"id":"title","component":{"Text":{"text":{"literalString":"🗺️ 三天旅行计划"},"usageHint":"h4"}}},{"id":"list","component":{"List":{"direction":"vertical","children":{"template":{"componentId":"item","dataBinding":"/days"}}}}},{"id":"item","component":{"Row":{"alignment":"center","children":{"explicitList":["dayLabel","dayDesc"]}}}},{"id":"dayLabel","component":{"Text":{"text":{"path":"label"},"usageHint":"h5"}}},{"id":"dayDesc","component":{"Text":{"text":{"path":"desc"},"usageHint":"body"}}}]}}
-{"dataModelUpdate":{"surfaceId":"${surfaceId}","contents":[{"key":"days","valueMap":[{"key":"d1","valueMap":[{"key":"label","valueString":"Day 1"},{"key":"desc","valueString":"市区漫步、博物馆、本地小吃"}]},{"key":"d2","valueMap":[{"key":"label","valueString":"Day 2"},{"key":"desc","valueString":"登山一日游"}]},{"key":"d3","valueMap":[{"key":"label","valueString":"Day 3"},{"key":"desc","valueString":"海边日落 + 返程"}]}]}]}}
+{"messages":[{"beginRendering":{"surfaceId":"${surfaceId}","root":"root"}},{"surfaceUpdate":{"surfaceId":"${surfaceId}","catalogId":"${STANDARD_CATALOG_ID}","components":[{"id":"root","component":{"Card":{"child":"col"}}},{"id":"col","component":{"Column":{"alignment":"stretch","children":{"explicitList":["title","list"]}}}},{"id":"title","component":{"Text":{"text":{"literalString":"🗺️ 三天旅行计划"},"usageHint":"h4"}}},{"id":"list","component":{"List":{"direction":"vertical","children":{"template":{"componentId":"item","dataBinding":"/days"}}}}},{"id":"item","component":{"Row":{"alignment":"center","children":{"explicitList":["dayLabel","dayDesc"]}}}},{"id":"dayLabel","component":{"Text":{"text":{"path":"label"},"usageHint":"h5"}}},{"id":"dayDesc","component":{"Text":{"text":{"path":"desc"},"usageHint":"body"}}}]}},{"dataModelUpdate":{"surfaceId":"${surfaceId}","contents":[{"key":"days","valueMap":[{"key":"d1","valueMap":[{"key":"label","valueString":"Day 1"},{"key":"desc","valueString":"市区漫步、博物馆、本地小吃"}]},{"key":"d2","valueMap":[{"key":"label","valueString":"Day 2"},{"key":"desc","valueString":"登山一日游"}]},{"key":"d3","valueMap":[{"key":"label","valueString":"Day 3"},{"key":"desc","valueString":"海边日落 + 返程"}]}]}]}}]}
 
 请严格遵守上述 schema 和规则。现在开始处理用户输入。`;
 }

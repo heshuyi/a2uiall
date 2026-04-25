@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@a2ui/protocol": "workspace:*",
-    "@google/genai": "^0.7.0",
+    "@google/genai": "^1.50.1",
     "better-sqlite3": "^11.7.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",

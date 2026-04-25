@@ -1,20 +1,22 @@
 /**
- * GeminiAgentRunner —— 调用 @google/genai SDK，真实流式接收 NDJSON 并按行
- * 解析为 A2UI server-to-client 消息，逐条 yield 给 SSE。
+ * GeminiAgentRunner —— 使用 @google/genai SDK 的 JSON mode + responseJsonSchema
+ * 实现流式接收并逐条 yield A2UI server-to-client 消息。
  *
- * 核心保障：
- * 1. beginRendering 一定是首条消息（强制注入 + 去重）
- * 2. 大消息自动分片，前端逐步渲染
- * 3. 模型输出不合规时自动修正（normalize / wrap / unwrap）
- * 4. 每次调用的 I/O 写日志到 apps/server/log/
+ * 核心设计：
+ * 1. responseMimeType: "application/json" —— Gemini constrained decoding 保证输出合法 JSON
+ * 2. responseJsonSchema —— API 层强制 { messages: [...] } 结构
+ * 3. 流式渐进提取 —— 用花括号深度追踪从 JSON 数组中逐步提取完整消息对象（不依赖换行）
+ * 4. beginRendering 一定是首条消息（强制注入 + 去重）
+ * 5. 大消息自动分片，前端逐步渲染
+ * 6. 每次调用的 I/O 写日志到 apps/server/log/
  */
 
 import { GoogleGenAI } from '@google/genai';
-import { STANDARD_CATALOG_ID, type ServerToClientMessage } from '@a2ui/protocol';
+import { type ServerToClientMessage } from '@a2ui/protocol';
 import { env } from '../env.js';
 import type { Turn } from '../types.js';
 import type { AgentInput, AgentRunner } from './types.js';
-import { buildSystemPrompt } from './prompt.js';
+import { buildSystemPrompt, buildResponseJsonSchema } from './prompt.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -55,57 +57,43 @@ export class GeminiAgentRunner implements AgentRunner {
     };
     const logBase = { ...logCtx, systemPrompt, userPrompt, contents };
 
-    let stream: AsyncGenerator<Awaited<ReturnType<typeof this.ai.models.generateContent>>>;
+    let stream: AsyncIterable<{ text?: string }>;
     try {
       stream = (await this.ai.models.generateContentStream({
         model: env.GEMINI_MODEL,
         contents,
-        config: { systemInstruction: systemPrompt, temperature: 0.7 },
-      })) as unknown as AsyncGenerator<Awaited<ReturnType<typeof this.ai.models.generateContent>>>;
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 0.7,
+          responseMimeType: 'application/json',
+          responseSchema: buildResponseJsonSchema() as any,
+        },
+      })) as AsyncIterable<{ text?: string }>;
     } catch (e) {
       void writeTurnLog({ ...logBase, rawOutput: '', parsedMessages: [], error: formatUpstreamError(e) });
       throw new Error(formatUpstreamError(e));
     }
 
-    let buf = '';
-    let anyYielded = false;
     let fullText = '';
     let beginSent = false;
+    let extractionCursor = 0;
     const parsedForLog: ServerToClientMessage[] = [];
 
-    async function* yieldMessages(msgs: ServerToClientMessage[]): AsyncIterable<ServerToClientMessage> {
-      for (const m of msgs) {
-        if (!beginSent && !('beginRendering' in (m as any))) {
-          beginSent = true;
-          anyYielded = true;
-          const begin = { beginRendering: { surfaceId: input.surfaceId, root: 'root' } } as ServerToClientMessage;
-          parsedForLog.push(begin);
-          yield begin;
-          await sleep(STREAM_STEP_DELAY_MS);
-        }
-        if ('beginRendering' in (m as any)) {
-          if (beginSent) continue;
-          beginSent = true;
-        }
-        anyYielded = true;
-        for await (const piece of explodeMessageForStreaming(m)) {
-          parsedForLog.push(piece);
-          yield piece;
-          await sleep(STREAM_STEP_DELAY_MS);
-        }
-      }
-    }
-
+    // ── 流式渐进提取 ──
     try {
       for await (const chunk of stream) {
         const delta = (chunk as any)?.text ?? '';
         if (!delta) continue;
         fullText += delta;
-        buf += delta;
-        const { lines, rest } = splitCompleteLines(buf);
-        buf = rest;
-        for (const line of lines) {
-          yield* yieldMessages(parseNdjsonLineToMessages(line, input.surfaceId));
+
+        const { messages, nextCursor } = extractCompleteMessages(fullText, extractionCursor);
+        extractionCursor = nextCursor;
+
+        for (const raw of messages) {
+          const msg = patchSurfaceId(raw, input.surfaceId);
+          yield* this.yieldMessage(msg, parsedForLog, input.surfaceId, beginSent);
+          if ('beginRendering' in (msg as any)) beginSent = true;
+          if (!beginSent) beginSent = true;
         }
       }
     } catch (e) {
@@ -113,31 +101,193 @@ export class GeminiAgentRunner implements AgentRunner {
       throw new Error(formatUpstreamError(e));
     }
 
-    if (buf.trim().length > 0) {
-      yield* yieldMessages(parseNdjsonLineToMessages(buf, input.surfaceId));
+    // ── 兜底：完整解析 fullText，补发流式阶段可能遗漏的消息 ──
+    const allMessages = parseFullOutput(fullText, input.surfaceId);
+    if (allMessages.length > countTopLevelMessages(parsedForLog)) {
+      for (const msg of allMessages) {
+        const type = getMessageType(msg);
+        if (type && !parsedForLog.some((m) => getMessageType(m) === type)) {
+          console.warn(`[a2ui/server] 兜底补发遗漏的 ${type} 消息`);
+          yield* this.yieldMessage(msg, parsedForLog, input.surfaceId, beginSent);
+          if (!beginSent) beginSent = true;
+        }
+      }
     }
 
-    if (!anyYielded) {
-      const messages = parseGeminiOutput(fullText, input.surfaceId);
-      if (messages.length > 0) {
-        const begin = { beginRendering: { surfaceId: input.surfaceId, root: 'root' } } as ServerToClientMessage;
-        parsedForLog.push(begin);
-        yield begin;
-        await sleep(STREAM_STEP_DELAY_MS);
-        for (const m of messages) {
-          if ('beginRendering' in (m as any)) continue;
-          for await (const piece of explodeMessageForStreaming(m)) {
-            parsedForLog.push(piece);
-            yield piece;
-            await sleep(STREAM_STEP_DELAY_MS);
-          }
-        }
+    if (parsedForLog.length === 0 && allMessages.length === 0) {
+      const errMsgs = errorMessages(input.surfaceId, `Gemini 输出无法解析为有效的 A2UI 消息。\n\n原文：\n${fullText.slice(0, 400)}`);
+      for (const m of errMsgs) {
+        parsedForLog.push(m);
+        yield m;
       }
     }
 
     void writeTurnLog({ ...logBase, rawOutput: fullText, parsedMessages: parsedForLog });
   }
+
+  private async *yieldMessage(
+    msg: ServerToClientMessage,
+    parsedForLog: ServerToClientMessage[],
+    surfaceId: string,
+    beginSent: boolean,
+  ): AsyncIterable<ServerToClientMessage> {
+    if (!beginSent && !('beginRendering' in (msg as any))) {
+      const begin = { beginRendering: { surfaceId, root: 'root' } } as ServerToClientMessage;
+      parsedForLog.push(begin);
+      yield begin;
+      await sleep(STREAM_STEP_DELAY_MS);
+    }
+    if ('beginRendering' in (msg as any) && beginSent) {
+      return;
+    }
+    for await (const piece of explodeMessageForStreaming(msg)) {
+      parsedForLog.push(piece);
+      yield piece;
+      await sleep(STREAM_STEP_DELAY_MS);
+    }
+  }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 渐进式 JSON 提取 —— 从流式累积的 JSON 文本中逐步提取 messages 数组内的完整对象
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 从 { "messages": [ {obj1}, {obj2}, ... ] } 的流式文本中，
+ * 用花括号深度追踪提取已完成的顶层对象。不依赖换行符。
+ */
+function extractCompleteMessages(
+  text: string,
+  startFrom: number,
+): { messages: ServerToClientMessage[]; nextCursor: number } {
+  // 首次：跳过 '{"messages":[' 部分，定位到数组内容开头
+  if (startFrom === 0) {
+    const arrayStart = text.indexOf('[');
+    if (arrayStart === -1) return { messages: [], nextCursor: 0 };
+    startFrom = arrayStart + 1;
+  }
+
+  const messages: ServerToClientMessage[] = [];
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let objStart = -1;
+  let nextCursor = startFrom;
+
+  for (let i = startFrom; i < text.length; i++) {
+    const c = text[i];
+
+    if (escape) { escape = false; continue; }
+    if (c === '\\' && inString) { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (c === '{') {
+      if (depth === 0) objStart = i;
+      depth++;
+    } else if (c === '}') {
+      depth--;
+      if (depth === 0 && objStart >= 0) {
+        const objStr = text.slice(objStart, i + 1);
+        try {
+          messages.push(JSON.parse(objStr) as ServerToClientMessage);
+        } catch {
+          console.warn('[a2ui/server] extractCompleteMessages: JSON.parse 失败', objStr.slice(0, 200));
+        }
+        nextCursor = i + 1;
+        objStart = -1;
+      }
+    }
+  }
+
+  return { messages, nextCursor };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 完整输出解析（兜底 / 非流式）
+// ══════════════════════════════════════════════════════════════════════════════
+
+function parseFullOutput(text: string, surfaceId: string): ServerToClientMessage[] {
+  let cleaned = text.trim();
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim();
+  }
+  try {
+    const parsed = JSON.parse(cleaned);
+    const messages: unknown[] = Array.isArray(parsed?.messages) ? parsed.messages : Array.isArray(parsed) ? parsed : [];
+    return messages
+      .filter((m): m is ServerToClientMessage => m != null && typeof m === 'object')
+      .map((m) => patchSurfaceId(m as ServerToClientMessage, surfaceId));
+  } catch {
+    return [];
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 辅助函数
+// ══════════════════════════════════════════════════════════════════════════════
+
+function patchSurfaceId(msg: ServerToClientMessage, surfaceId: string): ServerToClientMessage {
+  const m = msg as any;
+  if (m.surfaceUpdate && !m.surfaceUpdate.surfaceId) m.surfaceUpdate.surfaceId = surfaceId;
+  if (m.dataModelUpdate && !m.dataModelUpdate.surfaceId) m.dataModelUpdate.surfaceId = surfaceId;
+  if (m.beginRendering && !m.beginRendering.surfaceId) m.beginRendering.surfaceId = surfaceId;
+  return msg;
+}
+
+function getMessageType(msg: ServerToClientMessage): string | null {
+  const m = msg as any;
+  if (m.beginRendering) return 'beginRendering';
+  if (m.surfaceUpdate) return 'surfaceUpdate';
+  if (m.dataModelUpdate) return 'dataModelUpdate';
+  if (m.deleteSurface) return 'deleteSurface';
+  return null;
+}
+
+function countTopLevelMessages(msgs: ServerToClientMessage[]): number {
+  const types = new Set(msgs.map(getMessageType).filter(Boolean));
+  return types.size;
+}
+
+async function* explodeMessageForStreaming(
+  msg: ServerToClientMessage,
+): AsyncIterable<ServerToClientMessage> {
+  if ('surfaceUpdate' in (msg as any)) {
+    const su = (msg as any).surfaceUpdate as { surfaceId: string; catalogId?: string; components?: any[] };
+    const comps = Array.isArray(su.components) ? su.components : [];
+    if (comps.length <= SURFACE_UPDATE_BATCH_SIZE) {
+      yield msg;
+      return;
+    }
+    for (let i = 0; i < comps.length; i += SURFACE_UPDATE_BATCH_SIZE) {
+      yield {
+        surfaceUpdate: { ...su, components: comps.slice(i, i + SURFACE_UPDATE_BATCH_SIZE) },
+      } as ServerToClientMessage;
+    }
+    return;
+  }
+
+  if ('dataModelUpdate' in (msg as any)) {
+    const du = (msg as any).dataModelUpdate as { surfaceId: string; path?: string; contents?: any[] };
+    const contents = Array.isArray(du.contents) ? du.contents : [];
+    if (contents.length <= DATA_MODEL_BATCH_SIZE) {
+      yield msg;
+      return;
+    }
+    for (let i = 0; i < contents.length; i += DATA_MODEL_BATCH_SIZE) {
+      yield {
+        dataModelUpdate: { ...du, contents: contents.slice(i, i + DATA_MODEL_BATCH_SIZE) },
+      } as ServerToClientMessage;
+    }
+    return;
+  }
+
+  yield msg;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 日志 / 格式化
+// ══════════════════════════════════════════════════════════════════════════════
 
 async function writeTurnLog(payload: {
   surfaceId: string;
@@ -208,364 +358,17 @@ function historyToContents(t: Turn): Array<{ role: string; parts: Array<{ text: 
   ];
 }
 
-function parseGeminiOutput(text: string, surfaceId: string): ServerToClientMessage[] {
-  let cleaned = text.trim();
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim();
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (e) {
-    return errorMessages(surfaceId, `Gemini 输出无法解析为 JSON：${(e as Error).message}\n\n原文：\n${cleaned.slice(0, 400)}`);
-  }
-  const messages = (parsed as { messages?: unknown }).messages;
-  if (!Array.isArray(messages)) {
-    return errorMessages(surfaceId, 'Gemini 输出缺少 messages 数组');
-  }
-  const list = (messages as ServerToClientMessage[]).map((m) => normalizeMessage(m));
-
-  // 韧性兜底：如果 Gemini 没给 beginRendering，自动从第一个 surfaceUpdate 推断 root 并补一个
-  const hasBegin = list.some((m) => 'beginRendering' in m);
-  if (!hasBegin) {
-    const firstSurfaceUpdate = list.find(
-      (m): m is ServerToClientMessage & { surfaceUpdate: { components: Array<{ id: string }> } } =>
-        'surfaceUpdate' in m,
-    );
-    const rootId =
-      firstSurfaceUpdate?.surfaceUpdate.components.find((c) => c.id === 'root')?.id ??
-      firstSurfaceUpdate?.surfaceUpdate.components[0]?.id;
-    if (rootId) {
-      list.push({ beginRendering: { surfaceId, root: rootId } } as ServerToClientMessage);
-    }
-  }
-  return list;
-}
-
-function splitCompleteLines(s: string): { lines: string[]; rest: string } {
-  // 兼容 \r\n / \n。只处理“完整行”，最后一行留在 rest 等下一 chunk 补齐。
-  const parts = s.split(/\r?\n/);
-  if (parts.length <= 1) return { lines: [], rest: s };
-  const rest = parts.pop() ?? '';
-  const lines = parts.map((x) => x.trim()).filter((x) => x.length > 0);
-  return { lines, rest };
-}
-
-function parseNdjsonLineToMessages(line: string, surfaceId: string): ServerToClientMessage[] {
-  const cleaned = line.trim();
-  if (!cleaned) return [];
-  // 容错：模型偶尔会输出 ``` / 前后空白
-  if (cleaned === '```' || cleaned.toLowerCase() === '```json') return [];
-  if (cleaned === '[DONE]') return [];
-
-  let obj: unknown;
-  try {
-    obj = JSON.parse(cleaned);
-  } catch {
-    // 如果不是合法 JSON 行，忽略（避免整条流被打断）
-    return [];
-  }
-
-  // 容错：如果仍然输出了 { messages: [...] }，拆开
-  if (obj && typeof obj === 'object' && 'messages' in (obj as any) && Array.isArray((obj as any).messages)) {
-    return ((obj as any).messages as ServerToClientMessage[]).map((m) => normalizeMessage(m));
-  }
-
-  // 只接受“合法顶层消息”，避免模型输出半成品 JSON（组件实例/裸 valueMap）污染前端。
-  if (!looksLikeTopLevelMessage(obj)) {
-    // 兼容：模型有时会直接输出单个组件实例 {id, component:{...}}，这里自动包成 surfaceUpdate
-    if (looksLikeComponentInstance(obj)) {
-      return [
-        {
-          surfaceUpdate: {
-            surfaceId,
-            catalogId: STANDARD_CATALOG_ID,
-            components: [obj],
-          },
-        } as unknown as ServerToClientMessage,
-      ];
-    }
-    // 兼容：模型有时会直接输出单个 data entry {key, valueString/...}，包成 dataModelUpdate
-    if (looksLikeDataEntry(obj)) {
-      return [
-        normalizeMessage({
-          dataModelUpdate: { surfaceId, contents: [obj] },
-        } as unknown as ServerToClientMessage),
-      ];
-    }
-    return [];
-  }
-
-  // 普通：一行一个 message
-  const msg = obj as ServerToClientMessage;
-  // surfaceId 防呆：如果模型没填，强制补上（尽量不影响渲染）
-  if ('surfaceUpdate' in (msg as any) && (msg as any).surfaceUpdate && !(msg as any).surfaceUpdate.surfaceId) {
-    (msg as any).surfaceUpdate.surfaceId = surfaceId;
-  }
-  if ('dataModelUpdate' in (msg as any) && (msg as any).dataModelUpdate && !(msg as any).dataModelUpdate.surfaceId) {
-    (msg as any).dataModelUpdate.surfaceId = surfaceId;
-  }
-  if ('beginRendering' in (msg as any) && (msg as any).beginRendering && !(msg as any).beginRendering.surfaceId) {
-    (msg as any).beginRendering.surfaceId = surfaceId;
-  }
-  return [normalizeMessage(msg)];
-}
-
-function looksLikeTopLevelMessage(obj: unknown): boolean {
-  if (!obj || typeof obj !== 'object') return false;
-  const o = obj as any;
-  return Boolean(o.surfaceUpdate || o.dataModelUpdate || o.beginRendering || o.deleteSurface || o.messages);
-}
-
-function looksLikeComponentInstance(obj: unknown): boolean {
-  if (!obj || typeof obj !== 'object') return false;
-  const o = obj as any;
-  return typeof o.id === 'string' && o.component && typeof o.component === 'object';
-}
-
-function looksLikeDataEntry(obj: unknown): boolean {
-  if (!obj || typeof obj !== 'object') return false;
-  const o = obj as any;
-  if (typeof o.key !== 'string') return false;
-  return (
-    Object.prototype.hasOwnProperty.call(o, 'valueString') ||
-    Object.prototype.hasOwnProperty.call(o, 'valueNumber') ||
-    Object.prototype.hasOwnProperty.call(o, 'valueBoolean') ||
-    Array.isArray(o.valueMap) ||
-    Array.isArray(o.valueList)
-  );
-}
-
-async function* explodeMessageForStreaming(
-  msg: ServerToClientMessage,
-): AsyncIterable<ServerToClientMessage> {
-  // 把“大块消息”拆成更细粒度的增量，前端就会像 Theater demo 一样逐步渲染。
-
-  if ('surfaceUpdate' in (msg as any)) {
-    const su = (msg as any).surfaceUpdate as { surfaceId: string; catalogId?: string; components?: any[] };
-    const comps = Array.isArray(su.components) ? su.components : [];
-    if (comps.length <= SURFACE_UPDATE_BATCH_SIZE) {
-      yield msg;
-      return;
-    }
-    for (let i = 0; i < comps.length; i += SURFACE_UPDATE_BATCH_SIZE) {
-      yield {
-        surfaceUpdate: {
-          ...su,
-          components: comps.slice(i, i + SURFACE_UPDATE_BATCH_SIZE),
-        },
-      } as ServerToClientMessage;
-    }
-    return;
-  }
-
-  if ('dataModelUpdate' in (msg as any)) {
-    const du = (msg as any).dataModelUpdate as { surfaceId: string; path?: string; contents?: any[] };
-    const contents = Array.isArray(du.contents) ? du.contents : [];
-    if (contents.length <= DATA_MODEL_BATCH_SIZE) {
-      yield msg;
-      return;
-    }
-    for (let i = 0; i < contents.length; i += DATA_MODEL_BATCH_SIZE) {
-      yield {
-        dataModelUpdate: {
-          ...du,
-          contents: contents.slice(i, i + DATA_MODEL_BATCH_SIZE),
-        },
-      } as ServerToClientMessage;
-    }
-    return;
-  }
-
-  yield msg;
-}
-
-/**
- * 兼容 LLM 常见的“valueList”输出。
- *
- * 协议里 dataModelUpdate 没有 valueList（动态列表应使用 valueMap 表达，template.dataBinding 指向 map）。
- * 但 LLM 往往会产出：
- *   { key: "places", valueList: [ { valueMap: [...] }, ... ] }
- * 这里把它转换为：
- *   { key: "places", valueMap: [ { key:"0", valueMap:[...] }, { key:"1", valueMap:[...] } ] }
- */
-function normalizeMessage(msg: ServerToClientMessage): ServerToClientMessage {
-  if (!('dataModelUpdate' in msg)) return msg;
-  const update = (msg as any).dataModelUpdate as { contents?: unknown; path?: string } | undefined;
-  if (!update) return msg;
-
-  // 兼容：LLM 可能直接输出 contents 为「对象数组」：
-  // { dataModelUpdate: { path:"/items", contents: [ {name:"a"}, {name:"b"} ] } }
-  // 运行时需要的是 adjacency list（DataEntry[]），这里转换成：
-  // contents: [ { key:"0", valueMap:[{key:"name",valueString:"a"}] }, { key:"1", ... } ]
-  const coerced = coerceContentsToEntries(update.contents);
-  if (!Array.isArray(coerced)) return msg;
-
-  const normalizedContents = normalizeEntries(coerced);
-  return {
-    ...(msg as any),
-    dataModelUpdate: {
-      ...(msg as any).dataModelUpdate,
-      contents: normalizedContents,
-    },
-  } as ServerToClientMessage;
-}
-
-function coerceContentsToEntries(contents: unknown): any[] | null {
-  if (!contents) return null;
-  if (Array.isArray(contents)) {
-    // 已经是 DataEntry[] 的话（有 key 字段），直接返回
-    if (contents.every((x) => x && typeof x === 'object' && 'key' in (x as any))) return contents as any[];
-
-    // 对象数组：转成 indexed valueMap entries
-    if (contents.every((x) => x && typeof x === 'object' && !Array.isArray(x))) {
-      return (contents as any[]).map((obj, idx) => ({
-        key: String(idx),
-        valueMap: objectToEntries(obj),
-      }));
-    }
-    return null;
-  }
-  // 单个对象：转为 entries（写到 path 的 shallow merge）
-  if (typeof contents === 'object') {
-    return objectToEntries(contents as any);
-  }
-  return null;
-}
-
-function objectToEntries(obj: Record<string, unknown>): any[] {
-  const out: any[] = [];
-  for (const [k, v] of Object.entries(obj ?? {})) {
-    if (typeof v === 'string') out.push({ key: k, valueString: v });
-    else if (typeof v === 'number') out.push({ key: k, valueNumber: v });
-    else if (typeof v === 'boolean') out.push({ key: k, valueBoolean: v });
-    else if (v && typeof v === 'object' && !Array.isArray(v)) out.push({ key: k, valueMap: objectToEntries(v as any) });
-    else out.push({ key: k, valueString: JSON.stringify(v) });
-  }
-  return out;
-}
-
-function normalizeEntries(entries: any[]): any[] {
-  return entries.map((e) => normalizeEntry(e));
-}
-
-function normalizeEntry(entry: any): any {
-  if (!entry || typeof entry !== 'object') return entry;
-
-  // 兼容：LLM 会把真正字符串包一层 JSON 再塞进 valueString
-  // valueString: "{\"valueString\":\"1. 狗不理包子\"}" => valueString: "1. 狗不理包子"
-  if (typeof entry.valueString === 'string') {
-    const unwrapped = unwrapJsonValueString(entry.valueString);
-    if (unwrapped !== null) {
-      entry = { ...entry, valueString: unwrapped };
-    }
-  }
-
-  // 递归处理 valueMap
-  if (Array.isArray(entry.valueMap)) {
-    const normalized = normalizeEntries(entry.valueMap);
-    // 兼容：LLM 可能把“列表”错误地输出成扁平的 valueMap（重复 key：name/desc/name/desc...）。
-    // List.template.dataBinding 期望的是 map：{ snacks: { "0": {...}, "1": {...} } }
-    // 这里把重复 key 的 primitive entry 序列折叠成按序号分组的 valueMap。
-    const folded = foldFlatRepeatedKeyMapIntoIndexedMap(normalized);
-    return { ...entry, valueMap: folded };
-  }
-
-  // 把 valueList 转为 valueMap
-  if (Array.isArray(entry.valueList)) {
-    const items = entry.valueList as any[];
-    const mapped = items.map((it, idx) => {
-      // 常见：list item 是 { valueMap: [...] } 或直接是 map entries 数组
-      const inner = it && typeof it === 'object' && Array.isArray(it.valueMap) ? it.valueMap : it;
-      if (Array.isArray(inner)) {
-        return { key: String(idx), valueMap: normalizeEntries(inner) };
-      }
-      // 退化：如果 item 不是 map，尝试包成 primitive（字符串化）
-      return { key: String(idx), valueString: typeof inner === 'string' ? inner : JSON.stringify(inner) };
-    });
-    return { key: entry.key, valueMap: mapped };
-  }
-
-  return entry;
-}
-
-function unwrapJsonValueString(s: string): string | null {
-  const t = s.trim();
-  if (!(t.startsWith('{') && t.endsWith('}'))) return null;
-  try {
-    const parsed = JSON.parse(t);
-    if (parsed && typeof parsed === 'object') {
-      if (typeof (parsed as any).valueString === 'string') return (parsed as any).valueString;
-      if (typeof (parsed as any).literalString === 'string') return (parsed as any).literalString;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-function isPrimitiveEntry(e: any): boolean {
-  return (
-    e &&
-    typeof e === 'object' &&
-    typeof e.key === 'string' &&
-    (Object.prototype.hasOwnProperty.call(e, 'valueString') ||
-      Object.prototype.hasOwnProperty.call(e, 'valueNumber') ||
-      Object.prototype.hasOwnProperty.call(e, 'valueBoolean'))
-  );
-}
-
-function foldFlatRepeatedKeyMapIntoIndexedMap(entries: any[]): any[] {
-  if (!Array.isArray(entries) || entries.length === 0) return entries;
-
-  // 只在“全是 primitive entries 且存在重复 key”时触发；否则保持原样。
-  if (!entries.every((e) => isPrimitiveEntry(e))) return entries;
-
-  const seen = new Set<string>();
-  let hasDup = false;
-  for (const e of entries) {
-    if (seen.has(e.key)) {
-      hasDup = true;
-      break;
-    }
-    seen.add(e.key);
-  }
-  if (!hasDup) return entries;
-
-  const groups: any[][] = [];
-  let cur: any[] = [];
-  const curKeys = new Set<string>();
-  for (const e of entries) {
-    if (curKeys.has(e.key)) {
-      if (cur.length > 0) groups.push(cur);
-      cur = [];
-      curKeys.clear();
-    }
-    cur.push(e);
-    curKeys.add(e.key);
-  }
-  if (cur.length > 0) groups.push(cur);
-
-  return groups.map((g, idx) => ({
-    key: String(idx),
-    valueMap: g,
-  }));
-}
-
 function errorMessages(surfaceId: string, errText: string): ServerToClientMessage[] {
   return [
+    { beginRendering: { surfaceId, root: 'errRoot' } } as ServerToClientMessage,
     {
       surfaceUpdate: {
         surfaceId,
         components: [
           { id: 'errRoot', component: { Card: { child: 'errBody' } } },
-          {
-            id: 'errBody',
-            component: { Text: { text: { literalString: errText }, usageHint: 'body' } },
-          },
+          { id: 'errBody', component: { Text: { text: { literalString: errText }, usageHint: 'body' } } },
         ],
       },
     } as unknown as ServerToClientMessage,
-    { beginRendering: { surfaceId, root: 'errRoot' } } as ServerToClientMessage,
   ];
 }
