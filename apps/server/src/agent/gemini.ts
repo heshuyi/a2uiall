@@ -12,7 +12,7 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
-import { type ServerToClientMessage } from '@a2ui/protocol';
+import { STANDARD_CATALOG_ID, type ServerToClientMessage } from '@a2ui/protocol';
 import { env } from '../env.js';
 import type { Turn } from '../types.js';
 import type { AgentInput, AgentRunner } from './types.js';
@@ -75,7 +75,7 @@ export class GeminiAgentRunner implements AgentRunner {
     }
 
     let fullText = '';
-    let beginSent = false;
+    const beginState = { sent: false };
     let extractionCursor = 0;
     const parsedForLog: ServerToClientMessage[] = [];
 
@@ -90,10 +90,12 @@ export class GeminiAgentRunner implements AgentRunner {
         extractionCursor = nextCursor;
 
         for (const raw of messages) {
-          const msg = patchSurfaceId(raw, input.surfaceId);
-          yield* this.yieldMessage(msg, parsedForLog, input.surfaceId, beginSent);
-          if ('beginRendering' in (msg as any)) beginSent = true;
-          if (!beginSent) beginSent = true;
+          const msg = normalizeSurfaceId(raw, input.surfaceId);
+          if (!isValidServerToClientMessage(msg)) {
+            console.warn('[a2ui/server] drop_invalid_message (streaming extract)', msg);
+            continue;
+          }
+          yield* this.yieldMessage(msg, parsedForLog, input.surfaceId, beginState);
         }
       }
     } catch (e) {
@@ -108,8 +110,7 @@ export class GeminiAgentRunner implements AgentRunner {
         const type = getMessageType(msg);
         if (type && !parsedForLog.some((m) => getMessageType(m) === type)) {
           console.warn(`[a2ui/server] 兜底补发遗漏的 ${type} 消息`);
-          yield* this.yieldMessage(msg, parsedForLog, input.surfaceId, beginSent);
-          if (!beginSent) beginSent = true;
+          yield* this.yieldMessage(msg, parsedForLog, input.surfaceId, beginState);
         }
       }
     }
@@ -129,17 +130,24 @@ export class GeminiAgentRunner implements AgentRunner {
     msg: ServerToClientMessage,
     parsedForLog: ServerToClientMessage[],
     surfaceId: string,
-    beginSent: boolean,
+    beginState: { sent: boolean },
   ): AsyncIterable<ServerToClientMessage> {
-    if (!beginSent && !('beginRendering' in (msg as any))) {
-      const begin = { beginRendering: { surfaceId, root: 'root' } } as ServerToClientMessage;
+    const isBegin = 'beginRendering' in (msg as any);
+    if (!isBegin && !beginState.sent) {
+      const begin = {
+        beginRendering: { surfaceId, root: 'root', catalogId: STANDARD_CATALOG_ID },
+      } as ServerToClientMessage;
       parsedForLog.push(begin);
       yield begin;
+      beginState.sent = true;
       await sleep(STREAM_STEP_DELAY_MS);
     }
-    if ('beginRendering' in (msg as any) && beginSent) {
-      return;
+
+    if (isBegin) {
+      if (beginState.sent) return;
+      beginState.sent = true;
     }
+
     for await (const piece of explodeMessageForStreaming(msg)) {
       parsedForLog.push(piece);
       yield piece;
@@ -217,7 +225,8 @@ function parseFullOutput(text: string, surfaceId: string): ServerToClientMessage
     const messages: unknown[] = Array.isArray(parsed?.messages) ? parsed.messages : Array.isArray(parsed) ? parsed : [];
     return messages
       .filter((m): m is ServerToClientMessage => m != null && typeof m === 'object')
-      .map((m) => patchSurfaceId(m as ServerToClientMessage, surfaceId));
+      .map((m) => normalizeSurfaceId(m as ServerToClientMessage, surfaceId))
+      .filter(isValidServerToClientMessage);
   } catch {
     return [];
   }
@@ -227,11 +236,17 @@ function parseFullOutput(text: string, surfaceId: string): ServerToClientMessage
 // 辅助函数
 // ══════════════════════════════════════════════════════════════════════════════
 
-function patchSurfaceId(msg: ServerToClientMessage, surfaceId: string): ServerToClientMessage {
+function normalizeSurfaceId(msg: ServerToClientMessage, surfaceId: string): ServerToClientMessage {
   const m = msg as any;
-  if (m.surfaceUpdate && !m.surfaceUpdate.surfaceId) m.surfaceUpdate.surfaceId = surfaceId;
-  if (m.dataModelUpdate && !m.dataModelUpdate.surfaceId) m.dataModelUpdate.surfaceId = surfaceId;
-  if (m.beginRendering && !m.beginRendering.surfaceId) m.beginRendering.surfaceId = surfaceId;
+  // 纠正模型“写错 surfaceId”的情况：以服务端本轮 surfaceId 为准
+  if (m.surfaceUpdate) m.surfaceUpdate.surfaceId = surfaceId;
+  if (m.dataModelUpdate) m.dataModelUpdate.surfaceId = surfaceId;
+  if (m.beginRendering) m.beginRendering.surfaceId = surfaceId;
+  if (m.deleteSurface) m.deleteSurface.surfaceId = surfaceId;
+
+  // catalogId：对标准目录场景，缺失时补齐，避免前端协商/渲染歧义
+  if (m.surfaceUpdate && !m.surfaceUpdate.catalogId) m.surfaceUpdate.catalogId = STANDARD_CATALOG_ID;
+  if (m.beginRendering && !m.beginRendering.catalogId) m.beginRendering.catalogId = STANDARD_CATALOG_ID;
   return msg;
 }
 
@@ -242,6 +257,15 @@ function getMessageType(msg: ServerToClientMessage): string | null {
   if (m.dataModelUpdate) return 'dataModelUpdate';
   if (m.deleteSurface) return 'deleteSurface';
   return null;
+}
+
+function isValidServerToClientMessage(msg: ServerToClientMessage): boolean {
+  const m = msg as any;
+  if (!m || typeof m !== 'object') return false;
+  const keys = ['beginRendering', 'surfaceUpdate', 'dataModelUpdate', 'deleteSurface'];
+  const present = keys.filter((k) => m[k] != null);
+  // 必须“恰好一种消息类型”
+  return present.length === 1;
 }
 
 function countTopLevelMessages(msgs: ServerToClientMessage[]): number {

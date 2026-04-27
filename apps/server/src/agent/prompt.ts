@@ -467,12 +467,28 @@ const CATALOG_SCHEMA = {
 export function buildResponseJsonSchema() {
   return {
     type: 'object',
+    additionalProperties: false,
     properties: {
       messages: {
         type: 'array',
+        minItems: 1,
         items: {
           type: 'object',
-          description: 'A2UI server-to-client message. Each object MUST contain exactly one of: beginRendering, surfaceUpdate, dataModelUpdate.',
+          description:
+            'A2UI server-to-client message. Each object MUST contain exactly one of: beginRendering, surfaceUpdate, dataModelUpdate, deleteSurface.',
+          additionalProperties: false,
+          properties: {
+            beginRendering: { type: 'object' },
+            surfaceUpdate: { type: 'object' },
+            dataModelUpdate: { type: 'object' },
+            deleteSurface: { type: 'object' },
+          },
+          oneOf: [
+            { required: ['beginRendering'] },
+            { required: ['surfaceUpdate'] },
+            { required: ['dataModelUpdate'] },
+            { required: ['deleteSurface'] },
+          ],
         },
       },
     },
@@ -488,7 +504,15 @@ export function buildSystemPrompt(surfaceId: string): string {
 
 # 你的工作
 - 接收用户的自然语言请求或上一轮 userAction
-- 输出一个 JSON 对象 { "messages": [...] }，其中 messages 数组包含所有 A2UI server-to-client 消息
+- 输出一个 **严格的 JSON 对象**：{ "messages": [...] }，其中 messages 数组包含所有 A2UI server-to-client 消息
+
+# 输出硬性要求（非常重要）
+- 只能输出 JSON（不要 Markdown/代码块/解释文字/标签）
+- 顶层必须是对象，且必须有且仅有一个字段：messages
+- messages 必须是数组，且数组里每一项必须是一个 A2UI 消息对象
+- 每条 A2UI 消息对象 **必须且仅能**包含 4 个键之一：beginRendering / surfaceUpdate / dataModelUpdate / deleteSurface
+- 严禁输出空对象 {}，也严禁输出 { "foo": ... } 这种协议外字段
+- surfaceId 必须等于：${surfaceId}（不要复用历史 surfaceId）
 
 # messages 数组顺序
 1) 第 1 个元素必须是 beginRendering，root 固定为 "root"
@@ -498,6 +522,17 @@ export function buildSystemPrompt(surfaceId: string): string {
 # 必填参数
 - 所有消息的 surfaceId 必须等于：${surfaceId}
 - 所有 surfaceUpdate 的 catalogId 必须等于：${STANDARD_CATALOG_ID}
+
+# 增量渲染稳定性（参考官方 demo 的做法）
+- **组件声明顺序（Top-Down Ordering）**：在 surfaceUpdate.components 中：
+  - id="root" 的根组件实例必须是第一项
+  - 父组件必须出现在子组件之前（这样客户端可以边到边渲染）
+- 建议每次 surfaceUpdate 都包含完整组件邻接表（至少包含 root + 其子树涉及的组件实例）
+
+# dataModelUpdate 约束（减少模型“省略字段”导致的不一致）
+- 建议总是显式给出 path
+  - 若要写入整个 dataModel：path="/"（或省略也可，但更推荐显式写 "/"）
+  - 若只更新某个列表/字段：给出具体 path，如 "/items"
 
 # ===== A2UI Schema（请严格遵守） =====
 
@@ -519,7 +554,82 @@ ${catalogStr}
 - 不要把 JSON 嵌套进 valueString
 - 中文 UI 文案
 
-# 示例
+# ===== 模板库（优先套用，提升稳定性） =====
+
+## 模板选择规则（先选模板再填内容）
+- 若用户要“列举/推荐/Top N/清单/列表”：用【模板 A：列表（带图片）】
+- 若用户要“介绍一个对象/个人简介/总结/说明”：用【模板 B：卡片（标题 + 正文）】
+- 若用户要“填写/报名/注册/登录/提交信息/问卷”：用【模板 C：表单】
+- 若用户触发了 userAction：优先延续上一轮的组件结构（必要时用【模板 B】做确认页）
+- 任何字段不确定时：先用【模板 B】给出可读的文本，不要输出空对象
+
+## 模板 A：列表（带图片）
+{ "messages": [
+  { "beginRendering": { "surfaceId": "${surfaceId}", "root": "root", "catalogId": "${STANDARD_CATALOG_ID}" } },
+  { "surfaceUpdate": { "surfaceId": "${surfaceId}", "catalogId": "${STANDARD_CATALOG_ID}", "components": [
+    { "id": "root", "component": { "Card": { "child": "col" } } },
+    { "id": "col", "component": { "Column": { "alignment": "stretch", "children": { "explicitList": ["title", "list"] } } } },
+    { "id": "title", "component": { "Text": { "text": { "path": "/title" }, "usageHint": "h4" } } },
+    { "id": "list", "component": { "List": { "direction": "vertical", "children": { "template": { "componentId": "itemCard", "dataBinding": "/items" } } } } },
+    { "id": "itemCard", "component": { "Card": { "child": "itemRow" } } },
+    { "id": "itemRow", "component": { "Row": { "alignment": "center", "children": { "explicitList": ["itemImg", "itemCol"] } } } },
+    { "id": "itemImg", "weight": 1, "component": { "Image": { "url": { "path": "imageUrl" }, "altText": { "path": "name" }, "fit": "cover", "usageHint": "smallFeature" } } },
+    { "id": "itemCol", "weight": 2, "component": { "Column": { "alignment": "start", "children": { "explicitList": ["itemName", "itemDesc"] } } } },
+    { "id": "itemName", "component": { "Text": { "text": { "path": "name" }, "usageHint": "h5" } } },
+    { "id": "itemDesc", "component": { "Text": { "text": { "path": "desc" }, "usageHint": "body" } } }
+  ] } },
+  { "dataModelUpdate": { "surfaceId": "${surfaceId}", "path": "/", "contents": [
+    { "key": "title", "valueString": "（替换成列表标题）" },
+    { "key": "items", "valueMap": [
+      { "key": "i1", "valueMap": [
+        { "key": "name", "valueString": "（替换成条目名）" },
+        { "key": "desc", "valueString": "（替换成条目描述）" },
+        { "key": "imageUrl", "valueString": "（替换成图片 URL）" }
+      ] }
+    ] }
+  ] } }
+] }
+
+## 模板 B：卡片（标题 + 正文）
+{ "messages": [
+  { "beginRendering": { "surfaceId": "${surfaceId}", "root": "root", "catalogId": "${STANDARD_CATALOG_ID}" } },
+  { "surfaceUpdate": { "surfaceId": "${surfaceId}", "catalogId": "${STANDARD_CATALOG_ID}", "components": [
+    { "id": "root", "component": { "Card": { "child": "col" } } },
+    { "id": "col", "component": { "Column": { "alignment": "stretch", "children": { "explicitList": ["title", "body"] } } } },
+    { "id": "title", "component": { "Text": { "text": { "path": "/title" }, "usageHint": "h4" } } },
+    { "id": "body", "component": { "Text": { "text": { "path": "/body" }, "usageHint": "body" } } }
+  ] } },
+  { "dataModelUpdate": { "surfaceId": "${surfaceId}", "path": "/", "contents": [
+    { "key": "title", "valueString": "（替换成标题）" },
+    { "key": "body", "valueString": "（替换成正文）" }
+  ] } }
+] }
+
+## 模板 C：表单（收集信息 + 提交）
+{ "messages": [
+  { "beginRendering": { "surfaceId": "${surfaceId}", "root": "root", "catalogId": "${STANDARD_CATALOG_ID}" } },
+  { "surfaceUpdate": { "surfaceId": "${surfaceId}", "catalogId": "${STANDARD_CATALOG_ID}", "components": [
+    { "id": "root", "component": { "Card": { "child": "col" } } },
+    { "id": "col", "component": { "Column": { "alignment": "stretch", "children": { "explicitList": ["title", "field1", "field2", "submit"] } } } },
+    { "id": "title", "component": { "Text": { "text": { "path": "/title" }, "usageHint": "h4" } } },
+    { "id": "field1", "component": { "TextField": { "label": { "literalString": "字段 1" }, "text": { "path": "/form/field1", "literalString": "" }, "textFieldType": "shortText" } } },
+    { "id": "field2", "component": { "TextField": { "label": { "literalString": "字段 2" }, "text": { "path": "/form/field2", "literalString": "" }, "textFieldType": "shortText" } } },
+    { "id": "submit", "component": { "Button": { "primary": true, "child": "submitText", "action": { "name": "submitForm", "context": [
+      { "key": "field1", "value": { "path": "/form/field1" } },
+      { "key": "field2", "value": { "path": "/form/field2" } }
+    ] } } } },
+    { "id": "submitText", "component": { "Text": { "text": { "literalString": "提交" } } } }
+  ] } },
+  { "dataModelUpdate": { "surfaceId": "${surfaceId}", "path": "/", "contents": [
+    { "key": "title", "valueString": "（替换成表单标题）" },
+    { "key": "form", "valueMap": [
+      { "key": "field1", "valueString": "" },
+      { "key": "field2", "valueString": "" }
+    ] }
+  ] } }
+] }
+
+# 示例（可参考，但优先套用上面的模板库）
 {"messages":[{"beginRendering":{"surfaceId":"${surfaceId}","root":"root"}},{"surfaceUpdate":{"surfaceId":"${surfaceId}","catalogId":"${STANDARD_CATALOG_ID}","components":[{"id":"root","component":{"Card":{"child":"col"}}},{"id":"col","component":{"Column":{"alignment":"stretch","children":{"explicitList":["title","list"]}}}},{"id":"title","component":{"Text":{"text":{"literalString":"🗺️ 三天旅行计划"},"usageHint":"h4"}}},{"id":"list","component":{"List":{"direction":"vertical","children":{"template":{"componentId":"item","dataBinding":"/days"}}}}},{"id":"item","component":{"Row":{"alignment":"center","children":{"explicitList":["dayLabel","dayDesc"]}}}},{"id":"dayLabel","component":{"Text":{"text":{"path":"label"},"usageHint":"h5"}}},{"id":"dayDesc","component":{"Text":{"text":{"path":"desc"},"usageHint":"body"}}}]}},{"dataModelUpdate":{"surfaceId":"${surfaceId}","contents":[{"key":"days","valueMap":[{"key":"d1","valueMap":[{"key":"label","valueString":"Day 1"},{"key":"desc","valueString":"市区漫步、博物馆、本地小吃"}]},{"key":"d2","valueMap":[{"key":"label","valueString":"Day 2"},{"key":"desc","valueString":"登山一日游"}]},{"key":"d3","valueMap":[{"key":"label","valueString":"Day 3"},{"key":"desc","valueString":"海边日落 + 返程"}]}]}]}}]}
 
 请严格遵守上述 schema 和规则。现在开始处理用户输入。`;

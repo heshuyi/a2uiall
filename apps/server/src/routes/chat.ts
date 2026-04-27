@@ -23,6 +23,8 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { ServerToClientMessage } from '@a2ui/protocol';
 import type { AgentRunner } from '../agent/index.js';
+import { buildAgentFallbackSurface } from '../a2ui/fallback.js';
+import { isValidServerToClientMessage } from '../a2ui/validate.js';
 import { setupSse } from '../stream/sse.js';
 import type { SessionStorage, Turn } from '../types.js';
 
@@ -51,6 +53,7 @@ export function chatRouter(storage: SessionStorage, agent: AgentRunner): Router 
     const turnId = randomUUID();
     const surfaceId = `msg-${turnId}`;
     const collected: ServerToClientMessage[] = [];
+    let hasValidPayload = false;
 
     console.log(
       `[a2ui/server] POST /api/chat session=${body.sessionId} turn=${turnId} chars=${body.text.length}`,
@@ -67,6 +70,12 @@ export function chatRouter(storage: SessionStorage, agent: AgentRunner): Router 
         surfaceId,
       })) {
         if (sse.closed) break;
+        if (!isValidServerToClientMessage(msg)) {
+          console.warn('[a2ui/server] drop_invalid_message (route /chat)', { surfaceId, msg });
+          continue;
+        }
+        const type = Object.keys(msg)[0] ?? '';
+        if (type === 'surfaceUpdate' || type === 'dataModelUpdate') hasValidPayload = true;
         collected.push(msg);
         sse.send(msg);
       }
@@ -82,6 +91,18 @@ export function chatRouter(storage: SessionStorage, agent: AgentRunner): Router 
       sse.send({
         error: { code: 'agent_failure', message: (e as Error).message },
       });
+    }
+
+    // 如果 agent 没有产生任何可渲染的 payload（只有 beginRendering 或全是无效消息），给前端一个明确的错误 surface。
+    if (!sse.closed && !hasValidPayload) {
+      const fallback = buildAgentFallbackSurface(
+        surfaceId,
+        `这一轮 Agent 输出未包含可渲染的 surfaceUpdate/dataModelUpdate。\n\n请重试，或换一个表达方式。`,
+      );
+      for (const m of fallback) {
+        collected.push(m);
+        sse.send(m);
+      }
     }
 
     const turn: Turn = {
